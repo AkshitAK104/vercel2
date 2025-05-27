@@ -21,11 +21,28 @@ if (!supabaseUrl || !supabaseKey) {
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// --- Middleware ---
+// --- Enhanced CORS Configuration ---
+const allowedOrigins = process.env.ALLOWED_ORIGINS 
+  ? process.env.ALLOWED_ORIGINS.split(',')
+  : [
+      "http://localhost:3000",
+      "https://vercel2-2evz.vercel.app"
+    ];
+
 app.use(cors({
-  origin: process.env.FRONTEND_URL || "http://localhost:3000",
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   credentials: true
 }));
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -52,7 +69,8 @@ app.get("/", (req, res) => {
   res.json({ 
     success: true, 
     message: "Price Tracker API is running",
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    allowedOrigins: allowedOrigins
   });
 });
 
@@ -109,7 +127,7 @@ app.post("/track-product", async (req, res) => {
         "Accept-Encoding": "gzip, deflate, br",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
       },
-      timeout: 10000
+      timeout: 15000
     });
     
     const $ = cheerio.load(response.data);
@@ -127,7 +145,8 @@ app.post("/track-product", async (req, res) => {
       ".a-price .a-offscreen",
       ".a-price-whole",
       "#price_inside_buybox",
-      ".a-price.a-text-price.a-size-medium.apexPriceToPay .a-offscreen"
+      ".a-price.a-text-price.a-size-medium.apexPriceToPay .a-offscreen",
+      ".a-price-range .a-offscreen"
     ];
     
     let priceText = "";
@@ -230,6 +249,46 @@ app.get("/products", async (req, res) => {
   }
 });
 
+// === GET SINGLE PRODUCT ===
+app.get("/products/:id", async (req, res) => {
+  const { id } = req.params;
+  
+  try {
+    const { data, error } = await supabase
+      .from('products')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (error) throw error;
+
+    if (!data) {
+      return res.status(404).json({ 
+        success: false, 
+        message: "Product not found" 
+      });
+    }
+
+    const product = {
+      id: data.id,
+      name: data.name,
+      url: data.url,
+      image: data.image,
+      currentPrice: data.current_price,
+      priceHistory: data.price_history || [],
+      createdAt: data.created_at,
+    };
+    
+    res.json({ success: true, product });
+  } catch (err) {
+    console.error("Fetch single product error:", err.message);
+    res.status(500).json({ 
+      success: false, 
+      message: "Failed to fetch product." 
+    });
+  }
+});
+
 // === DELETE PRODUCT ===
 app.delete("/products/:id", async (req, res) => {
   const { id } = req.params;
@@ -273,6 +332,20 @@ app.post("/api/alerts", async (req, res) => {
   }
 
   try {
+    // Check if product exists
+    const { data: product, error: productError } = await supabase
+      .from('products')
+      .select('id')
+      .eq('id', productId)
+      .single();
+
+    if (productError || !product) {
+      return res.status(404).json({ 
+        success: false, 
+        message: "Product not found." 
+      });
+    }
+
     const { data, error } = await supabase
       .from('alerts')
       .insert([{
@@ -293,6 +366,107 @@ app.post("/api/alerts", async (req, res) => {
     res.status(500).json({ 
       success: false, 
       message: "Failed to save alert." 
+    });
+  }
+});
+
+// === GET ALERTS FOR PRODUCT ===
+app.get("/api/alerts/:productId", async (req, res) => {
+  const { productId } = req.params;
+  
+  try {
+    const { data, error } = await supabase
+      .from('alerts')
+      .select('*')
+      .eq('product_id', productId)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    res.json({ success: true, alerts: data });
+  } catch (err) {
+    console.error("Fetch alerts error:", err.message);
+    res.status(500).json({ 
+      success: false, 
+      message: "Failed to fetch alerts." 
+    });
+  }
+});
+
+// === MANUAL PRICE UPDATE ===
+app.post("/products/:id/update-price", async (req, res) => {
+  const { id } = req.params;
+  
+  try {
+    const { data: product, error: fetchError } = await supabase
+      .from('products')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (fetchError || !product) {
+      return res.status(404).json({ 
+        success: false, 
+        message: "Product not found" 
+      });
+    }
+
+    // Scrape current price
+    const response = await axios.get(product.url, { 
+      headers: { 
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+      },
+      timeout: 15000
+    });
+    
+    const $ = cheerio.load(response.data);
+    const priceSelectors = [
+      "#priceblock_ourprice",
+      "#priceblock_dealprice", 
+      "#priceblock_saleprice",
+      ".a-price .a-offscreen",
+      ".a-price-whole",
+      "#price_inside_buybox"
+    ];
+    
+    let priceText = "";
+    for (const selector of priceSelectors) {
+      priceText = $(selector).first().text().trim();
+      if (priceText) break;
+    }
+    
+    const price = parseFloat(priceText.replace(/[₹,\s]/g, "").replace(/[^0-9.]/g, ""));
+    
+    if (!price || isNaN(price)) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Could not extract current price" 
+      });
+    }
+
+    const currentDate = new Date().toISOString();
+    const updatedHistory = [...(product.price_history || []), { date: currentDate, price }];
+
+    const { error: updateError } = await supabase
+      .from('products')
+      .update({
+        current_price: price,
+        price_history: updatedHistory
+      })
+      .eq('id', id);
+
+    if (updateError) throw updateError;
+
+    res.json({ 
+      success: true, 
+      message: "Price updated successfully", 
+      newPrice: price 
+    });
+  } catch (err) {
+    console.error("Manual price update error:", err.message);
+    res.status(500).json({ 
+      success: false, 
+      message: "Failed to update price" 
     });
   }
 });
@@ -327,7 +501,7 @@ cron.schedule("*/30 * * * *", async () => {
           headers: { 
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
           },
-          timeout: 10000
+          timeout: 15000
         });
         
         const $ = cheerio.load(response.data);
@@ -417,8 +591,12 @@ cron.schedule("*/30 * * * *", async () => {
 });
 
 // === MULTI-PLATFORM ROUTES ===
-const multiplatformRoutes = require('./multiplatform');
-app.use('/api/multiplatform', multiplatformRoutes);
+try {
+  const multiplatformRoutes = require('./multiplatform');
+  app.use('/api/multiplatform', multiplatformRoutes);
+} catch (error) {
+  console.log("⚠️ Multiplatform routes not found, skipping...");
+}
 
 // === ERROR HANDLING MIDDLEWARE ===
 app.use((err, req, res, next) => {
@@ -442,4 +620,5 @@ app.listen(PORT, () => {
   console.log(`✅ Backend running at http://localhost:${PORT}`);
   console.log(`🔗 Supabase URL: ${supabaseUrl}`);
   console.log(`📧 Email configured: ${process.env.EMAIL_USER || 'cakshit131@gmail.com'}`);
+  console.log(`🌐 Allowed origins: ${allowedOrigins.join(', ')}`);
 });
